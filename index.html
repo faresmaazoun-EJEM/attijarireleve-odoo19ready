@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relevé bancaire → Odoo</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --carte: #ffffff; --texte: #1d2433; --doux: #5b6475;
+    --bord: #cfd5df; --accent: #714b67; --accent-texte: #ffffff;
+    --ok-fond: #e7f6ec; --ok-texte: #17663a; --err-fond: #fdecec; --err-texte: #a12828;
+    --survol: #f1ebf0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161b; --carte: #1d2027; --texte: #e8eaf0; --doux: #a3aab8;
+      --bord: #3a3f4b; --accent: #b98aad; --accent-texte: #14161b;
+      --ok-fond: #15301f; --ok-texte: #8fdcaa; --err-fond: #3a1a1a; --err-texte: #f3a3a3;
+      --survol: #2a2430;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161b; --carte: #1d2027; --texte: #e8eaf0; --doux: #a3aab8;
+    --bord: #3a3f4b; --accent: #b98aad; --accent-texte: #14161b;
+    --ok-fond: #15301f; --ok-texte: #8fdcaa; --err-fond: #3a1a1a; --err-texte: #f3a3a3;
+    --survol: #2a2430;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--texte);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+    display: flex; justify-content: center; padding: 48px 16px;
+  }
+  main { width: 100%; max-width: 640px; }
+  h1 { font-size: 1.6rem; margin: 0 0 24px; }
+  #zone {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; min-height: 200px; padding: 24px; text-align: center; cursor: pointer;
+    background: var(--carte); border: 2px dashed var(--bord); border-radius: 12px;
+    transition: border-color .15s, background .15s;
+  }
+  #zone:hover, #zone:focus-visible, #zone.survol { border-color: var(--accent); background: var(--survol); outline: none; }
+  #zone strong { font-size: 1.05rem; }
+  #zone span { color: var(--doux); font-size: .9rem; }
+  #message { margin-top: 20px; padding: 14px 16px; border-radius: 10px; display: none; overflow-wrap: anywhere; }
+  #message.ok { display: block; background: var(--ok-fond); color: var(--ok-texte); }
+  #message.erreur { display: block; background: var(--err-fond); color: var(--err-texte); }
+  #telecharger {
+    display: none; width: 100%; margin-top: 12px; padding: 12px 16px; border: 0; border-radius: 10px;
+    background: var(--accent); color: var(--accent-texte); font: inherit; font-weight: 600; cursor: pointer;
+  }
+  #telecharger:hover { filter: brightness(1.08); }
+  footer { margin-top: 28px; color: var(--doux); font-size: .82rem; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+<main>
+  <h1>🏦 Relevé bancaire → Odoo 19</h1>
+
+  <label id="zone" tabindex="0">
+    <strong>Glisser ou sélectionner un relevé bancaire (.xlsx, .xls, .csv)</strong>
+    <span>Le fichier prêt pour Odoo se télécharge automatiquement.</span>
+    <input id="fichier" type="file" accept=".xlsx,.xls,.csv" hidden>
+  </label>
+
+  <div id="message" role="status"></div>
+  <button id="telecharger" type="button"></button>
+
+  <footer>Traitement 100 % local : le relevé ne quitte jamais cet ordinateur.</footer>
+</main>
+
+<script>
+"use strict";
+/* =========================================================================
+   Relevé bancaire -> Odoo 19 Enterprise (version navigateur, sans installation)
+   Produit « <NomOriginal>_ready_odoo_upload.xlsx » avec 4 colonnes :
+   DATE OPERATION | LIBELLE (libellé + référence) | DEBIT (TND) | CREDIT (TND)
+   ========================================================================= */
+
+const SUFFIXE_SORTIE = "_ready_odoo_upload.xlsx";
+const NB_LIGNES_SCAN = 30;          // lignes balayées pour trouver l'en-tête
+// En-têtes du fichier de sortie (LIBELLE = libellé + référence combinés)
+const COLONNES_SORTIE = ["DATE OPERATION", "LIBELLE", "DEBIT (TND)", "CREDIT (TND)"];
+
+// Mots-clés déjà normalisés (minuscules, sans accents), par ordre de priorité
+const MOTS_DATE = ["date operation", "date op", "date comptable", "date"];
+const MOTS_LIBELLE = ["libelle", "designation", "description", "operation", "details", "detail"];
+const MOTS_REFERENCE = ["reference", "ref", "n piece", "no piece", "num piece", "piece",
+                        "numero", "num", "cheque", "doc"];
+const MOTS_DEBIT = ["debit"];
+const MOTS_CREDIT = ["credit"];
+
+const MOIS = { jan: 1, janv: 1, janvier: 1, january: 1, fev: 2, fevr: 2, fevrier: 2, feb: 2, february: 2,
+  mar: 3, mars: 3, march: 3, avr: 4, avril: 4, apr: 4, april: 4, mai: 5, may: 5, juin: 6, jun: 6, june: 6,
+  juil: 7, juillet: 7, jul: 7, july: 7, aou: 8, aout: 8, aug: 8, august: 8, sep: 9, sept: 9, septembre: 9,
+  september: 9, oct: 10, octobre: 10, october: 10, nov: 11, novembre: 11, november: 11,
+  dec: 12, decembre: 12, december: 12 };
+
+class ErreurReleve extends Error {}
+
+/* ------------------------------ Utilitaires ------------------------------ */
+function estVide(v) {
+  if (v === null || v === undefined) return true;
+  if (typeof v === "number" && Number.isNaN(v)) return true;
+  if (typeof v === "string" && v.trim() === "") return true;
+  return false;
+}
+
+// « N° Pièce » -> « n piece », « Date opé. » -> « date ope »
+function normaliser(t) {
+  if (estVide(t)) return "";
+  return String(t).normalize("NFKD").replace(/[̀-ͯ]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// Chaque mot du mot-clé doit commencer un mot consécutif de l'en-tête
+// (« ref » ⊂ « reference », « date op » ⊂ « date ope »)
+function correspond(entete, motCle) {
+  const h = entete.split(" ").filter(Boolean), k = motCle.split(" ");
+  for (let i = 0; i <= h.length - k.length; i++) {
+    if (k.every((mot, j) => h[i + j].startsWith(mot))) return true;
+  }
+  return false;
+}
+
+// Nombre entier sans notation scientifique ni « .0 »
+function entierEnTexte(n) {
+  return n.toLocaleString("fullwide", { useGrouping: false, maximumFractionDigits: 0 });
+}
+
+// Texte propre d'une cellule (espaces nettoyés, pas de « .0 » ni de « 1,2E+11 »)
+function texteCellule(v) {
+  if (estVide(v)) return "";
+  if (typeof v === "number") return Number.isInteger(v) ? entierEnTexte(v) : String(v);
+  let s = String(v).replace(/[  ]/g, " ").replace(/\s+/g, " ").trim();
+  if (["nan", "none", "null", "nat"].includes(s.toLowerCase())) return "";
+  if (/^\d+\.0+$/.test(s)) {
+    s = s.split(".")[0];                                     // « 123456.0 » -> « 123456 »
+  } else if (/^[+-]?\d+(?:[.,]\d+)?[eE][+-]?\d+$/.test(s)) { // « 1.23E+11 »
+    const n = Number(s.replace(",", "."));
+    if (Number.isInteger(n)) s = entierEnTexte(n);
+  }
+  return s;
+}
+
+// Reconnaît un montant sans le modifier : nombre Excel, « 1 234,567 », « 1.234,56 »,
+// « 1,234.56 », « (12,50) », « 12,50- », « 12,500 DT »...
+function convertirNombre(v) {
+  if (estVide(v) || typeof v === "boolean") return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  let s = String(v).trim().replace(/[   '’]/g, "");
+  let negatif = false;
+  if (s.startsWith("(") && s.endsWith(")")) { negatif = true; s = s.slice(1, -1); }
+  if (s.endsWith("-")) { negatif = true; s = s.slice(0, -1); }
+  s = s.replace(/[^\d,.\-+]/g, "");                          // supprime devises et lettres
+  if (!/\d/.test(s)) return null;
+  if (s.includes(",") && s.includes(".")) {
+    // le dernier séparateur rencontré est le séparateur décimal
+    s = s.lastIndexOf(",") > s.lastIndexOf(".") ? s.replace(/\./g, "").replace(",", ".") : s.replace(/,/g, "");
+  } else if (s.includes(",")) {
+    s = (s.match(/,/g).length > 1) ? s.replace(/,/g, "") : s.replace(",", ".");
+  } else if ((s.match(/\./g) || []).length > 1) {
+    s = s.replace(/\./g, "");
+  }
+  if (!/^[+-]?(\d+\.?\d*|\.\d+)$/.test(s)) return null;
+  const n = Number(s);
+  return negatif ? -n : n;
+}
+
+/* --------- Dates : représentées en interne par le n° de série Excel --------- */
+const ORIGINE_EXCEL = Date.UTC(1899, 11, 30);
+const JOUR_MS = 86400000;
+
+function serieDepuisAMJ(a, m, j) {
+  if (a < 100) a += a < 69 ? 2000 : 1900;
+  if (a < 1990 || a > 2100 || m < 1 || m > 12 || j < 1 || j > 31) return null;
+  const t = Date.UTC(a, m - 1, j), d = new Date(t);
+  if (d.getUTCMonth() !== m - 1 || d.getUTCDate() !== j) return null;   // ex. 31/02
+  return Math.round((t - ORIGINE_EXCEL) / JOUR_MS);
+}
+
+function convertirDate(v) {
+  if (estVide(v)) return null;
+  if (v instanceof Date) return serieDepuisAMJ(v.getFullYear(), v.getMonth() + 1, v.getDate());
+  if (typeof v === "number") return (v > 20000 && v < 80000) ? Math.floor(v) : null;
+  const s = String(v).trim();
+  const candidats = [s, s.split(/[\sT]/)[0]];
+  for (const t of candidats) {
+    let r;
+    if ((r = t.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4}|\d{2})$/)))          // JJ/MM/AAAA
+      { const x = serieDepuisAMJ(+r[3], +r[2], +r[1]); if (x !== null) return x; }
+    if ((r = t.match(/^(\d{4})[\/.\-](\d{1,2})[\/.\-](\d{1,2})$/)))                // AAAA-MM-JJ
+      { const x = serieDepuisAMJ(+r[1], +r[2], +r[3]); if (x !== null) return x; }
+    if ((r = t.match(/^\d{8}$/))) {                                                // AAAAMMJJ ou JJMMAAAA
+      const x = serieDepuisAMJ(+t.slice(0, 4), +t.slice(4, 6), +t.slice(6, 8));
+      if (x !== null) return x;
+      const y = serieDepuisAMJ(+t.slice(4, 8), +t.slice(2, 4), +t.slice(0, 2));
+      if (y !== null) return y;
+    }
+    const n = normaliser(t);                                                       // 05 janv. 2026
+    if ((r = n.match(/^(\d{1,2}) ([a-z]+) (\d{4}|\d{2})$/)) && MOIS[r[2]])
+      { const x = serieDepuisAMJ(+r[3], MOIS[r[2]], +r[1]); if (x !== null) return x; }
+  }
+  if (/^\d{5}(\.0+)?$/.test(s)) return convertirDate(Number(s));                 // série Excel en texte
+  return null;
+}
+
+/* ------------------------- Lecture du fichier ------------------------- */
+function decoderTexte(octets) {
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(octets); }
+  catch (e) { return new TextDecoder("windows-1252").decode(octets); }    // cp1252 / latin1
+}
+
+// Faux .xls bancaire au format HTML : lit chaque <table> (cellules en texte)
+function lireHtml(texte) {
+  const doc = new DOMParser().parseFromString(texte, "text/html");
+  const tableaux = [];
+  for (const table of doc.querySelectorAll("table")) {
+    const lignes = [];
+    for (const tr of table.rows) {                 // n'inclut pas les tableaux imbriqués
+      const ligne = [];
+      for (const td of tr.cells) {
+        const morceaux = [];
+        const marcheur = doc.createTreeWalker(td, NodeFilter.SHOW_TEXT);
+        while (marcheur.nextNode()) morceaux.push(marcheur.currentNode.nodeValue);
+        ligne.push(morceaux.join(" ").replace(/\s+/g, " ").trim());
+        for (let k = 1; k < (td.colSpan || 1); k++) ligne.push("");   // garde l'alignement
+      }
+      lignes.push(ligne);
+    }
+    if (lignes.length) tableaux.push(completer(lignes));
+  }
+  return tableaux;
+}
+
+// CSV : devine le séparateur (; , tabulation |) et gère les guillemets
+function lireCsv(texte) {
+  const echantillon = texte.split(/\r?\n/).filter(l => l.trim()).slice(0, 200);
+  let sep = ";", meilleur = -1;
+  for (const c of [";", ",", "\t", "|"]) {
+    const comptes = echantillon.map(l => l.split(c).length - 1).filter(n => n > 0);
+    if (!comptes.length) continue;
+    const freq = {};
+    comptes.forEach(n => { freq[n] = (freq[n] || 0) + 1; });
+    const [valeur, f] = Object.entries(freq).sort((a, b) => b[1] - a[1])[0];
+    if (valeur * f > meilleur) { meilleur = valeur * f; sep = c; }
+  }
+  const lignes = []; let ligne = [], champ = "", guillemets = false;
+  for (let i = 0; i < texte.length; i++) {
+    const ch = texte[i];
+    if (guillemets) {
+      if (ch === '"') { if (texte[i + 1] === '"') { champ += '"'; i++; } else guillemets = false; }
+      else champ += ch;
+    } else if (ch === '"' && champ === "") guillemets = true;
+    else if (ch === sep) { ligne.push(champ); champ = ""; }
+    else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && texte[i + 1] === "\n") i++;
+      ligne.push(champ); lignes.push(ligne); ligne = []; champ = "";
+    } else champ += ch;
+  }
+  if (champ !== "" || ligne.length) { ligne.push(champ); lignes.push(ligne); }
+  return completer(lignes);
+}
+
+function completer(lignes) {
+  const largeur = Math.max(0, ...lignes.map(l => l.length));
+  return lignes.map(l => l.concat(Array(largeur - l.length).fill("")));
+}
+
+// Le format est déterminé par le contenu réel du fichier, pas par son extension
+function lireTableaux(buffer) {
+  const o = new Uint8Array(buffer);
+  const estXlsx = o[0] === 0x50 && o[1] === 0x4b && o[2] === 0x03 && o[3] === 0x04;
+  const estXls = o[0] === 0xd0 && o[1] === 0xcf && o[2] === 0x11 && o[3] === 0xe0;
+  if (estXlsx || estXls) {
+    // cellDates:false -> les dates arrivent en n° de série Excel (aucun décalage de fuseau horaire)
+    const classeur = XLSX.read(o, { type: "array", cellDates: false });
+    return classeur.SheetNames.map(nom =>
+      XLSX.utils.sheet_to_json(classeur.Sheets[nom], { header: 1, raw: true, defval: null, blankrows: true }));
+  }
+  const texte = decoderTexte(o);
+  if (/<\s*table/i.test(texte.slice(0, 200000))) return lireHtml(texte);
+  return [lireCsv(texte)];
+}
+
+/* ----------------- Détection de l'en-tête et des colonnes ----------------- */
+function trouverColonne(entetes, mots, prises, interdits = []) {
+  for (const mot of mots) {
+    for (let i = 0; i < entetes.length; i++) {
+      const h = entetes[i];
+      if (prises.has(i) || !h) continue;
+      if (interdits.some(x => correspond(h, x))) continue;
+      if (correspond(h, mot)) return i;
+    }
+  }
+  return null;
+}
+
+function detecterColonnes(entetes) {
+  const prises = new Set(), col = {};
+  const prendre = (role, i) => { col[role] = i; if (i !== null) prises.add(i); };
+  prendre("debit", trouverColonne(entetes, MOTS_DEBIT, prises));
+  prendre("credit", trouverColonne(entetes, MOTS_CREDIT, prises));
+  // « Date valeur » n'est retenue que s'il n'existe aucune autre date
+  let d = trouverColonne(entetes, MOTS_DATE, prises, ["valeur"]);
+  if (d === null) d = trouverColonne(entetes, MOTS_DATE, prises);
+  prendre("date", d);
+  prendre("libelle", trouverColonne(entetes, MOTS_LIBELLE, prises));
+  col.reference = trouverColonne(entetes, MOTS_REFERENCE, prises, ["date"]);
+  return col;
+}
+
+// Première des 30 premières lignes contenant date + libellé + débit et/ou crédit
+function trouverEntete(lignes) {
+  for (let i = 0; i < Math.min(NB_LIGNES_SCAN, lignes.length); i++) {
+    const col = detecterColonnes((lignes[i] || []).map(normaliser));
+    if (col.date !== null && col.libelle !== null && (col.debit !== null || col.credit !== null))
+      return { iEntete: i, col };
+  }
+  return null;
+}
+
+function estLigneSoldeOuTotal(libelle) {
+  return /^(ancien |nouveau )?solde\b|^totaux?\b( des| mouvements| general| page)|^report\b/.test(normaliser(libelle));
+}
+
+/* ------------------------ Transformation principale ------------------------ */
+function nettoyerReleve(buffer) {
+  let lignesBrutes = null, entete = null;
+  for (const t of lireTableaux(buffer)) {
+    entete = trouverEntete(t);
+    if (entete) { lignesBrutes = t; break; }
+  }
+  if (!entete) throw new ErreurReleve("Ligne d'en-tête introuvable dans les 30 premières lignes : " +
+    "le tableau doit contenir des colonnes Date, Libellé et Débit/Crédit.");
+
+  const { iEntete, col } = entete;
+  const valeurDe = (ligne, i) => (i === null ? null : ligne[i]);
+  const resultat = [];
+  let precedenteAcceptee = false;   // pour rattacher un libellé écrit sur plusieurs lignes
+
+  for (const ligne of lignesBrutes.slice(iEntete + 1)) {
+    if (!ligne) { precedenteAcceptee = false; continue; }
+    const d = convertirDate(ligne[col.date]);
+    const libelle = texteCellule(ligne[col.libelle]);
+    const reference = col.reference === null ? "" : texteCellule(ligne[col.reference]);
+    const debit = convertirNombre(valeurDe(ligne, col.debit));
+    const credit = convertirNombre(valeurDe(ligne, col.credit));
+
+    if (d === null) {
+      // Suite de libellé : seule la cellule libellé est remplie sur la ligne
+      const autresVides = ligne.every((v, j) => j === col.libelle || estVide(v));
+      if (precedenteAcceptee && libelle && autresVides && !estLigneSoldeOuTotal(libelle))
+        resultat[resultat.length - 1].libelle += " " + libelle;
+      else precedenteAcceptee = false;           // ligne vide, total, en-tête répété, pied de page
+      continue;
+    }
+    if ((debit === null && credit === null) || estLigneSoldeOuTotal(libelle)) {
+      precedenteAcceptee = false; continue;
+    }
+    resultat.push({ date: d, libelle, reference, debit, credit });
+    precedenteAcceptee = true;
+  }
+  if (!resultat.length) throw new ErreurReleve("Aucune opération (date + montant) n'a été trouvée sous la ligne d'en-tête.");
+
+  // Colonne combinée ; les colonnes d'origine Libellé et Référence ne sont pas reprises
+  return resultat.map(l => ({
+    date: l.date,
+    libelleRef: l.reference ? (l.libelle ? `${l.libelle} - Réf: ${l.reference}` : `Réf: ${l.reference}`) : l.libelle,
+    debit: l.debit,
+    credit: l.credit,
+  }));
+}
+
+// Fichier Excel final : en-têtes ligne 1, données dès la ligne 2, dates AAAA-MM-JJ
+function genererClasseur(operations) {
+  const ws = {};
+  const cellule = (r, c, v) => { ws[XLSX.utils.encode_cell({ r, c })] = v; };
+  COLONNES_SORTIE.forEach((t, c) => cellule(0, c, { t: "s", v: t }));
+  operations.forEach((op, i) => {
+    const r = i + 1;
+    cellule(r, 0, { t: "n", v: op.date, z: "yyyy-mm-dd" });
+    cellule(r, 1, { t: "s", v: op.libelleRef });
+    if (op.debit !== null) cellule(r, 2, { t: "n", v: op.debit });
+    if (op.credit !== null) cellule(r, 3, { t: "n", v: op.credit });
+  });
+  ws["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: operations.length, c: 3 } });
+  ws["!cols"] = [{ wch: 12 }, { wch: 70 }, { wch: 15 }, { wch: 15 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Releve");
+  return wb;
+}
+
+/* ------------------------------ Interface ------------------------------ */
+const zone = document.getElementById("zone");
+const entree = document.getElementById("fichier");
+const message = document.getElementById("message");
+const bouton = document.getElementById("telecharger");
+let dernier = null;
+
+function afficher(type, texte) { message.className = type; message.textContent = texte; }
+
+function telecharger() { if (dernier) XLSX.writeFile(dernier.classeur, dernier.nom); }
+
+async function traiterFichier(fichier) {
+  bouton.style.display = "none";
+  dernier = null;
+  try {
+    if (typeof XLSX === "undefined") throw new Error("bibliothèque Excel non chargée.");
+    const operations = nettoyerReleve(await fichier.arrayBuffer());
+    const nom = fichier.name.replace(/\.[^.]+$/, "") + SUFFIXE_SORTIE;
+    dernier = { classeur: genererClasseur(operations), nom };
+    telecharger();                                  // téléchargement immédiat
+    afficher("ok", `✔ ${operations.length} opérations converties — ${nom}`);
+    bouton.textContent = `⬇ Télécharger à nouveau ${nom}`;
+    bouton.style.display = "block";
+  } catch (e) {
+    afficher("erreur", e instanceof ErreurReleve ? e.message : `Impossible de lire ce fichier : ${e.message}`);
+  }
+}
+
+entree.addEventListener("change", () => { if (entree.files[0]) traiterFichier(entree.files[0]); entree.value = ""; });
+zone.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); entree.click(); } });
+["dragenter", "dragover"].forEach(t => zone.addEventListener(t, e => { e.preventDefault(); zone.classList.add("survol"); }));
+["dragleave", "drop"].forEach(t => zone.addEventListener(t, e => { e.preventDefault(); zone.classList.remove("survol"); }));
+zone.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) traiterFichier(f); });
+// Un fichier lâché à côté de la zone ne doit pas être ouvert par le navigateur
+["dragover", "drop"].forEach(t => window.addEventListener(t, e => e.preventDefault()));
+bouton.addEventListener("click", telecharger);
+
+// Exposé pour les tests
+window.convertisseurOdoo = { nettoyerReleve, genererClasseur, convertirDate, convertirNombre, texteCellule };
+</script>
+</body>
+</html>
